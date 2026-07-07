@@ -1,0 +1,74 @@
+name: Scraper Yemen
+
+on:
+  schedule:
+    - cron: "0 */2 * * *"
+  workflow_dispatch:
+
+# Prevent a manual run and a scheduled run (or two schedules) from overlapping.
+# Overlapping runs would read/write the same tracker and could double-post.
+concurrency:
+  group: scraper
+  cancel-in-progress: false
+
+# Let the workflow push the updated tracker file back to the repo.
+permissions:
+  contents: write
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330   # stay under the 6h hard ceiling; tune to your run length
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scraper
+        env:
+          MISTRAL_API_KEY:  ${{ secrets.MISTRAL_API_KEY }}
+          WP_USERNAME:      ${{ secrets.WP_USERNAME }}
+          WP_APP_PASSWORD:  ${{ secrets.WP_APP_PASSWORD }}
+          WP_BASE_URL:      ${{ secrets.WP_BASE_URL }}
+        run: python ye.py
+
+      # -- Commit the updated tracker back into the repo --------------------
+      # This is what makes dedup work across runs: processed_jobs.csv is checked
+      # out fresh next run, the scraper reads it, and skips anything recorded.
+      # Runs even if the scraper failed part-way, so IDs saved before a crash
+      # are still persisted.
+      - name: Persist processed_jobs.csv
+        if: always()
+        run: |
+          if [ ! -f processed_jobs.csv ]; then
+            echo "No processed_jobs.csv produced -- nothing to commit."
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f processed_jobs.csv
+          if git diff --cached --quiet; then
+            echo "Tracker unchanged -- no commit needed."
+          else
+            git commit -m "Update processed_jobs.csv [skip ci]"
+            git pull --rebase --autostash origin ${{ github.ref_name }} || true
+            git push origin HEAD:${{ github.ref_name }}
+          fi
+
+      - name: Upload Excel + tracker as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jobs-output-${{ github.run_id }}
+          path: |
+            jobs_output.xlsx
+            processed_jobs.csv
+          retention-days: 7
